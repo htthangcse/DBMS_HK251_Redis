@@ -1,23 +1,539 @@
-const XLSX = require("xlsx");
+const fs = require("fs");
+const path = require("path");
 const mysql = require("mysql2/promise");
-const redis = require("redis");
+const redis = require("redis");;
+const XLSX = require("xlsx");
+const csvParser = require('csv-parser');
 const readline = require("readline");
 
 // =========================
-// 1. READ EXCEL FILE
+// READ FILES FROM data
 // =========================
-const workbook = XLSX.readFile("./Radiologists Report.xlsx");
-const sheet = workbook.Sheets[workbook.SheetNames[0]];
-const rows = XLSX.utils.sheet_to_json(sheet);
+async function readClinicalNotesFromCSV(csvPath) {
+  console.log("Reading clinical notes from CSV...");
 
-console.log("=".repeat(60));
-console.log("DEMO SO SÁNH REDIS vs MySQL");
-console.log("=".repeat(60));
-console.log(`Loaded Excel rows: ${rows.length}`);
-console.log(`Columns: ${Object.keys(rows[0]).join(", ")}\n`);
+  return new Promise((resolve, reject) => {
+    const notes = new Map();
+
+    fs.createReadStream(csvPath)
+      .pipe(csvParser())
+      .on('data', (row) => {
+        const patientId = parseInt(row['Patient ID']);
+        const clinicalNotes = row["Clinician's Notes"] || "";
+
+        if (patientId && clinicalNotes) {
+          notes.set(patientId, clinicalNotes);
+        }
+      })
+      .on('end', () => {
+        console.log(`✓ Loaded clinical notes for ${notes.size} patients\n`);
+        resolve(notes);
+      })
+      .on('error', reject);
+  });
+}
+function readMetadataFromJSON(metadataDir) {
+  console.log("Reading metadata from JSON files...");
+
+  const metadataPath = path.join(metadataDir, "metadata");
+
+  if (!fs.existsSync(metadataPath)) {
+    console.error(`Metadata directory not found: ${metadataPath}`);
+    return [];
+  }
+
+  const files = fs.readdirSync(metadataPath).filter(f => f.endsWith('.json'));
+  console.log(`Found ${files.length} JSON files (patients)\n`);
+
+  const patientMetadata = [];
+
+  for (const file of files) {
+    try {
+      const filePath = path.join(metadataPath, file);
+      const content = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(content);
+
+      // Each file is an array of images for one patient
+      if (Array.isArray(data) && data.length > 0) {
+        patientMetadata.push({
+          filename: file,
+          images: data
+        });
+      }
+    } catch (err) {
+      console.error(`Error reading ${file}: ${err.message}`);
+    }
+  }
+
+  console.log(`✓ Loaded ${patientMetadata.length} patient files`);
+  const totalImages = patientMetadata.reduce((sum, p) => sum + p.images.length, 0);
+  console.log(`✓ Total images: ${totalImages}\n`);
+
+  return patientMetadata;
+}
 
 // =========================
-// 2. MYSQL CONNECTION
+// PROCESS METADATA INTO PATIENT STRUCTURE
+// =========================
+function processMetadataIntoPatients(patientMetadataFiles) {
+  console.log("Processing patient metadata files...");
+
+  const patients = [];
+
+  for (const patientFile of patientMetadataFiles) {
+    const firstImage = patientFile.images[0];
+
+    // Extract patient ID from file path
+    let patientId = null;
+    const pathMatch = firstImage.File.match(/\\(\d{4})\\/);
+    if (pathMatch) {
+      patientId = parseInt(pathMatch[1], 10);
+    } else {
+      // Fallback: use filename
+      const filenameMatch = patientFile.filename.match(/(\d+)/);
+      patientId = filenameMatch ? parseInt(filenameMatch[1], 10) : patients.length + 1;
+    }
+
+    // Create patient record
+    const patient = {
+      patient_id: patientId,
+      patient_name: firstImage.PatientName || `Patient_${String(patientId).padStart(4, '0')}`,
+      patient_sex: firstImage.PatientSex || "",
+      patient_age: firstImage.PatientAge || "",
+      patient_size: firstImage.PatientSize || "",
+      patient_weight: firstImage.PatientWeight || "",
+      patient_birth_date: firstImage.PatientBirthDate || "",
+      body_part_examined: firstImage.BodyPartExamined || "",
+      clinical_notes: firstImage.StudyDescription || "",
+      study_instance_uid: firstImage.StudyInstanceUID || "",
+      images: [],
+      total_images: 0,
+      total_size: 0,
+      modalities: new Set()
+    };
+
+    // Process all images
+    for (const imgMeta of patientFile.images) {
+      patient.images.push({
+        file_path: imgMeta.File || "",
+        file_name: path.basename(imgMeta.File || ""),
+        file_size: 0, // Not available in JSON
+        modality: imgMeta.Modality || "UNKNOWN",
+        instance_number: imgMeta.InstanceNumber || "",
+        series_number: imgMeta.SeriesNumber || "",
+        acquisition_number: imgMeta.AcquisitionNumber || "",
+        created_at: new Date(),
+        metadata: imgMeta
+      });
+
+      patient.total_images++;
+      patient.modalities.add(imgMeta.Modality || "UNKNOWN");
+    }
+
+    patient.modalities = Array.from(patient.modalities);
+    patients.push(patient);
+  }
+
+  console.log(`✓ Processed ${patients.length} patients`);
+  const totalImages = patients.reduce((sum, p) => sum + p.total_images, 0);
+  console.log(`✓ Total images: ${totalImages}\n`);
+
+  return patients;
+}
+
+// =========================
+// MODIFIED INSERT DATA FUNCTION
+// =========================
+async function insertData(db, redisClient, patientData) {
+  console.log("=".repeat(60));
+  console.log("INSERTING DATA INTO DATABASES");
+  console.log("=".repeat(60));
+
+  const clinicalNotesMap = await readClinicalNotesFromCSV("./data/text_data.csv");
+
+  let totalPatients = 0;
+  let totalImages = 0;
+  let totalMetadata = 0;
+  const BATCH_SIZE = 50;
+
+  for (let i = 0; i < patientData.length; i += BATCH_SIZE) {
+    const batch = patientData.slice(i, i + BATCH_SIZE);
+
+    for (let patient of batch) {
+      const {
+        patient_id,
+        patient_name,
+        patient_sex,
+        patient_age,
+        patient_size,
+        patient_weight,
+        patient_birth_date,
+        body_part_examined,
+        study_instance_uid,
+        images,
+        total_images,
+        total_size,
+        modalities
+      } = patient;
+
+      const clinical_notes = clinicalNotesMap.get(patient_id) || patient.clinical_notes || "";
+
+      // === MySQL: Insert patient ===
+      await db.execute(
+        `REPLACE INTO medical_patients 
+         (patient_id, patient_name, clinical_notes, total_images, total_size, modalities,
+          patient_sex, patient_age, patient_size, patient_weight, patient_birth_date, 
+          body_part_examined, study_instance_uid) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          patient_id,
+          patient_name,
+          clinical_notes,
+          total_images,
+          total_size,
+          JSON.stringify(modalities),
+          patient_sex || "",
+          patient_age || "",
+          patient_size || "",
+          patient_weight || "",
+          patient_birth_date || "",
+          body_part_examined || "",
+          study_instance_uid || ""
+        ]
+      );
+
+      // === Redis: Store patient ===
+      await redisClient.hSet(`medical:patient:${patient_id}`, {
+        patient_id: String(patient_id),
+        patient_name: patient_name || "",
+        clinical_notes: clinical_notes,
+        total_images: String(total_images),
+        total_size: String(total_size),
+        modalities: JSON.stringify(modalities),
+        patient_sex: patient_sex || "",
+        patient_age: patient_age || "",
+        patient_size: patient_size || "",
+        patient_weight: patient_weight || "",
+        patient_birth_date: patient_birth_date || "",
+        body_part_examined: body_part_examined || "",
+        study_instance_uid: study_instance_uid || ""
+      });
+
+      // === Insert images and metadata ===
+      for (let j = 0; j < images.length; j++) {
+        const img = images[j];
+        totalImages++;
+
+        // MySQL: Insert image
+        await db.execute(
+          `INSERT INTO medical_images 
+           (patient_id, file_path, file_name, file_size, modality, 
+            instance_number, series_number, acquisition_number, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            patient_id,
+            img.file_path,
+            img.file_name,
+            img.file_size,
+            img.modality,
+            img.instance_number || "",
+            img.series_number || "",
+            img.acquisition_number || "",
+            img.created_at
+          ]
+        );
+
+        // Redis: Store image
+        await redisClient.hSet(`medical:image:${totalImages}`, {
+          image_id: String(totalImages),
+          patient_id: String(patient_id),
+          file_path: img.file_path,
+          file_name: img.file_name,
+          file_size: String(img.file_size),
+          modality: img.modality,
+          instance_number: img.instance_number || "",
+          series_number: img.series_number || "",
+          acquisition_number: img.acquisition_number || ""
+        });
+
+        // Add to patient's image set
+        await redisClient.sAdd(`medical:patient:${patient_id}:images`, String(totalImages));
+
+        // Store metadata
+        if (img.metadata && Object.keys(img.metadata).length > 0) {
+          const meta = img.metadata;
+
+
+          try {
+            const values = [
+              patient_id,
+              j,
+              img.file_path,
+              meta.SOPClassUID || "",
+              meta.SOPInstanceUID || "",
+              meta.StudyInstanceUID || "",
+              meta.SeriesInstanceUID || "",
+              meta.FrameOfReferenceUID || "",
+              meta.StudyDate || "",
+              meta.StudyTime || "",
+              meta.SeriesDate || "",
+              meta.SeriesTime || "",
+              meta.AcquisitionDate || "",
+              meta.AcquisitionTime || "",
+              meta.ContentDate || "",
+              meta.ContentTime || "",
+              meta.AccessionNumber || "",
+              meta.StudyID || "",
+              meta.SeriesNumber || "",
+              meta.AcquisitionNumber || "",
+              meta.InstanceNumber || "",
+              meta.Modality || "",
+              meta.Manufacturer || "",
+              meta.InstitutionName || "",
+              meta.ManufacturerModelName || "",
+              meta.SoftwareVersions || "",
+              meta.PatientPosition || "",
+              meta.BodyPartExamined || "",
+              meta.ScanningSequence || "",
+              meta.SequenceVariant || "",
+              meta.ScanOptions || "",
+              meta.MRAcquisitionType || "",
+              meta.SequenceName || "",
+              meta.SliceThickness || "",
+              meta.SpacingBetweenSlices || "",
+              meta.RepetitionTime || "",
+              meta.EchoTime || "",
+              meta.EchoNumbers || "",
+              meta.NumberOfAverages || "",
+              meta.ImagingFrequency || "",
+              meta.ImagedNucleus || "",
+              meta.MagneticFieldStrength || "",
+              meta.NumberOfPhaseEncodingSteps || "",
+              meta.EchoTrainLength || "",
+              meta.PercentSampling || "",
+              meta.PercentPhaseFieldOfView || "",
+              meta.PixelBandwidth || "",
+              meta.FlipAngle || "",
+              meta.VariableFlipAngleFlag || "",
+              meta.SAR || "",
+              meta.dBdt || "",
+              meta.ImagePositionPatient || "",
+              meta.ImageOrientationPatient || "",
+              meta.SliceLocation || "",
+              meta.PositionReferenceIndicator || "",
+              meta.SamplesPerPixel || "",
+              meta.PhotometricInterpretation || "",
+              meta.Rows || "",
+              meta.Columns || "",
+              meta.PixelSpacing || "",
+              meta.BitsAllocated || "",
+              meta.BitsStored || "",
+              meta.HighBit || "",
+              meta.PixelRepresentation || "",
+              meta.SmallestImagePixelValue || "",
+              meta.LargestImagePixelValue || "",
+              meta.WindowCenter || "",
+              meta.WindowWidth || "",
+              meta.WindowCenterWidthExplanation || "",
+              meta.AcquisitionMatrix || "",
+              meta.InPlanePhaseEncodingDirection || "",
+              meta.TransmitCoilName || "",
+              meta.StudyDescription || "",
+              meta.SeriesDescription || "",
+              meta.RequestedProcedureDescription || "",
+              meta.PerformedProcedureStepStartDate || "",
+              meta.PerformedProcedureStepStartTime || "",
+              meta.PerformedProcedureStepID || "",
+              meta.PerformedProcedureStepDescription || "",
+              meta.CommentsOnThePerformedProcedureStep || "",
+              meta.ReferringPhysicianName || "",
+              meta.PerformingPhysicianName || "",
+              meta.SpecificCharacterSet || "",
+              meta.PatientIdentityRemoved || "",
+              meta.DeidentificationMethod || "",
+              meta.ImageType || "",
+              meta.AngioFlag || "",
+              meta.InstanceCreationDate || "",
+              meta.InstanceCreationTime || "",
+              JSON.stringify(meta)
+            ];
+
+
+            // Câu SQL với đúng 90 placeholders
+            await db.execute(
+              `INSERT INTO medical_metadata (
+            patient_id, image_index, file_path,
+            sop_class_uid, sop_instance_uid, study_instance_uid, series_instance_uid, frame_of_reference_uid,
+            study_date, study_time, series_date, series_time, acquisition_date, acquisition_time, 
+            content_date, content_time, accession_number, study_id, series_number, acquisition_number, instance_number,
+            modality, manufacturer, institution_name, manufacturer_model_name, software_versions,
+            patient_position, body_part_examined,
+            scanning_sequence, sequence_variant, scan_options, mr_acquisition_type, sequence_name,
+            slice_thickness, spacing_between_slices, repetition_time, echo_time, echo_numbers,
+            number_of_averages, imaging_frequency, imaged_nucleus, magnetic_field_strength,
+            number_of_phase_encoding_steps, echo_train_length, percent_sampling, percent_phase_field_of_view,
+            pixel_bandwidth, flip_angle, variable_flip_angle_flag, sar, db_dt,
+            image_position_patient, image_orientation_patient, slice_location, position_reference_indicator,
+            samples_per_pixel, photometric_interpretation, image_rows, image_columns, pixel_spacing,
+            bits_allocated, bits_stored, high_bit, pixel_representation,
+            smallest_image_pixel_value, largest_image_pixel_value, window_center, window_width,
+            window_center_width_explanation, acquisition_matrix, in_plane_phase_encoding_direction,
+            transmit_coil_name, study_description, series_description, requested_procedure_description,
+            performed_procedure_step_start_date, performed_procedure_step_start_time, 
+            performed_procedure_step_id, performed_procedure_step_description, comments_on_performed_procedure_step,
+            referring_physician_name, performing_physician_name, specific_character_set,
+            patient_identity_removed, deidentification_method, image_type, angio_flag,
+            instance_creation_date, instance_creation_time, metadata_json
+          ) VALUES (
+            ${Array(90).fill("?").join(",")}
+          )`,
+              values
+            );
+
+          } catch (err) {
+            console.error(`Error inserting MySQL metadata: ${err.message}`);
+          }
+
+          // Redis: Store metadata as HASH with all fields
+          const metadataKey = `metadata:${patient_id}:${j}`;
+          try {
+            const redisMetadata = {
+              patient_id: String(patient_id),
+              image_index: String(j),
+              file_path: img.file_path,
+
+              // Convert all metadata fields to strings
+              sop_class_uid: meta.SOPClassUID || "",
+              sop_instance_uid: meta.SOPInstanceUID || "",
+              study_instance_uid: meta.StudyInstanceUID || "",
+              series_instance_uid: meta.SeriesInstanceUID || "",
+              frame_of_reference_uid: meta.FrameOfReferenceUID || "",
+
+              study_date: meta.StudyDate || "",
+              study_time: meta.StudyTime || "",
+              series_date: meta.SeriesDate || "",
+              series_time: meta.SeriesTime || "",
+              acquisition_date: meta.AcquisitionDate || "",
+              acquisition_time: meta.AcquisitionTime || "",
+              content_date: meta.ContentDate || "",
+              content_time: meta.ContentTime || "",
+              accession_number: meta.AccessionNumber || "",
+              study_id: meta.StudyID || "",
+              series_number: meta.SeriesNumber || "",
+              acquisition_number: meta.AcquisitionNumber || "",
+              instance_number: meta.InstanceNumber || "",
+
+              modality: meta.Modality || "",
+              manufacturer: meta.Manufacturer || "",
+              institution_name: meta.InstitutionName || "",
+              manufacturer_model_name: meta.ManufacturerModelName || "",
+              software_versions: meta.SoftwareVersions || "",
+
+              patient_position: meta.PatientPosition || "",
+              body_part_examined: meta.BodyPartExamined || "",
+
+              scanning_sequence: meta.ScanningSequence || "",
+              sequence_variant: meta.SequenceVariant || "",
+              scan_options: meta.ScanOptions || "",
+              mr_acquisition_type: meta.MRAcquisitionType || "",
+              sequence_name: meta.SequenceName || "",
+              slice_thickness: meta.SliceThickness || "",
+              spacing_between_slices: meta.SpacingBetweenSlices || "",
+              repetition_time: meta.RepetitionTime || "",
+              echo_time: meta.EchoTime || "",
+              echo_numbers: meta.EchoNumbers || "",
+              number_of_averages: meta.NumberOfAverages || "",
+              imaging_frequency: meta.ImagingFrequency || "",
+              imaged_nucleus: meta.ImagedNucleus || "",
+              magnetic_field_strength: meta.MagneticFieldStrength || "",
+              number_of_phase_encoding_steps: meta.NumberOfPhaseEncodingSteps || "",
+              echo_train_length: meta.EchoTrainLength || "",
+              percent_sampling: meta.PercentSampling || "",
+              percent_phase_field_of_view: meta.PercentPhaseFieldOfView || "",
+              pixel_bandwidth: meta.PixelBandwidth || "",
+              flip_angle: meta.FlipAngle || "",
+              variable_flip_angle_flag: meta.VariableFlipAngleFlag || "",
+              sar: meta.SAR || "",
+              db_dt: meta.dBdt || "",
+
+              image_position_patient: meta.ImagePositionPatient || "",
+              image_orientation_patient: meta.ImageOrientationPatient || "",
+              slice_location: meta.SliceLocation || "",
+              position_reference_indicator: meta.PositionReferenceIndicator || "",
+
+              samples_per_pixel: meta.SamplesPerPixel || "",
+              photometric_interpretation: meta.PhotometricInterpretation || "",
+              rows: meta.Rows || "",
+              columns: meta.Columns || "",
+              pixel_spacing: meta.PixelSpacing || "",
+              bits_allocated: meta.BitsAllocated || "",
+              bits_stored: meta.BitsStored || "",
+              high_bit: meta.HighBit || "",
+              pixel_representation: meta.PixelRepresentation || "",
+              smallest_image_pixel_value: meta.SmallestImagePixelValue || "",
+              largest_image_pixel_value: meta.LargestImagePixelValue || "",
+              window_center: meta.WindowCenter || "",
+              window_width: meta.WindowWidth || "",
+              window_center_width_explanation: meta.WindowCenterWidthExplanation || "",
+
+              acquisition_matrix: meta.AcquisitionMatrix || "",
+              in_plane_phase_encoding_direction: meta.InPlanePhaseEncodingDirection || "",
+              transmit_coil_name: meta.TransmitCoilName || "",
+
+              study_description: meta.StudyDescription || "",
+              series_description: meta.SeriesDescription || "",
+              requested_procedure_description: meta.RequestedProcedureDescription || "",
+              performed_procedure_step_start_date: meta.PerformedProcedureStepStartDate || "",
+              performed_procedure_step_start_time: meta.PerformedProcedureStepStartTime || "",
+              performed_procedure_step_id: meta.PerformedProcedureStepID || "",
+              performed_procedure_step_description: meta.PerformedProcedureStepDescription || "",
+              comments_on_performed_procedure_step: meta.CommentsOnThePerformedProcedureStep || "",
+
+              referring_physician_name: meta.ReferringPhysicianName || "",
+              performing_physician_name: meta.PerformingPhysicianName || "",
+
+              specific_character_set: meta.SpecificCharacterSet || "",
+              patient_identity_removed: meta.PatientIdentityRemoved || "",
+              deidentification_method: meta.DeidentificationMethod || "",
+
+              image_type: meta.ImageType || "",
+              angio_flag: meta.AngioFlag || "",
+              instance_creation_date: meta.InstanceCreationDate || "",
+              instance_creation_time: meta.InstanceCreationTime || "",
+
+              // Full JSON as backup
+              metadata_json: JSON.stringify(meta)
+            };
+
+            await redisClient.hSet(metadataKey, redisMetadata);
+            totalMetadata++;
+
+            if (totalMetadata <= 3) {
+              console.log(`✓ Inserted metadata: ${metadataKey}`);
+            }
+          } catch (err) {
+            console.error(`Error storing Redis metadata: ${err.message}`);
+          }
+        }
+      }
+
+      totalPatients++;
+
+      if (totalPatients % 10 === 0) {
+        process.stdout.write(`\rProcessed: ${totalPatients}/${patientData.length} patients (${totalMetadata} metadata)...`);
+      }
+    }
+  }
+
+  console.log();
+  console.log(`✓ Inserted ${totalPatients} patients`);
+  console.log(`✓ Inserted ${totalImages} images`);
+  console.log(`✓ Inserted ${totalMetadata} metadata records`);
+  console.log(`✓ Data loaded successfully\n`);
+}
+
+// =========================
+// MODIFIED initMySQL TO ADD NEW FIELDS
 // =========================
 async function initMySQL() {
   const db = await mysql.createConnection({
@@ -28,586 +544,694 @@ async function initMySQL() {
     port: 3306
   });
 
-  // TABLE 1: Patients
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS patients (
-      patient_id INT PRIMARY KEY,
-      clinician_notes TEXT,
-      FULLTEXT(clinician_notes)
-    );
-  `);
+  console.log("✓ MySQL connected");
 
-  // TABLE 2: Counter (for performance demo)
+  // // Drop existing tables
+  try {
+    await db.execute(`DROP TABLE IF EXISTS medical_metadata;`);
+    await db.execute(`DROP TABLE IF EXISTS medical_images;`);
+    await db.execute(`DROP TABLE IF EXISTS medical_patients;`);
+    await db.execute(`DROP TABLE IF EXISTS counter;`);
+    console.log("✓ Dropped old tables");
+  } catch (err) {
+    console.log("No old tables to drop");
+  }
+
+  // TABLE: medical_patients (with additional fields)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS medical_patients (
+      patient_id INT PRIMARY KEY,
+      patient_name VARCHAR(255),
+      patient_sex VARCHAR(10),
+      patient_age VARCHAR(20),
+      patient_size VARCHAR(20),
+      patient_weight VARCHAR(20),
+      patient_birth_date VARCHAR(20),
+      body_part_examined VARCHAR(100),
+      study_instance_uid TEXT,
+      clinical_notes TEXT,
+      total_images INT DEFAULT 0,
+      total_size BIGINT DEFAULT 0,
+      modalities TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_patient_name (patient_name),
+      INDEX idx_body_part (body_part_examined),
+      FULLTEXT(clinical_notes)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+  console.log("✓ Created medical_patients table");
+
+  // TABLE: medical_images
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS medical_images (
+      image_id INT AUTO_INCREMENT PRIMARY KEY,
+      patient_id INT,
+      file_path TEXT,
+      file_name VARCHAR(255),
+      file_size BIGINT,
+      modality VARCHAR(50),
+      instance_number VARCHAR(20),
+      series_number VARCHAR(20),
+      acquisition_number VARCHAR(20),
+      created_at TIMESTAMP,
+      INDEX idx_patient_id (patient_id),
+      INDEX idx_modality (modality),
+      INDEX idx_series (series_number),
+      FOREIGN KEY (patient_id) REFERENCES medical_patients(patient_id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+  console.log("✓ Created medical_images table");
+
+  // TABLE: medical_metadata
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS medical_metadata (
+      metadata_id INT AUTO_INCREMENT PRIMARY KEY,
+      patient_id INT,
+      image_index INT,
+      file_path TEXT,
+      
+      -- DICOM Core Fields
+      sop_class_uid TEXT,
+      sop_instance_uid TEXT,
+      study_instance_uid TEXT,
+      series_instance_uid TEXT,
+      frame_of_reference_uid TEXT,
+      
+      -- Study/Series Information
+      study_date VARCHAR(20),
+      study_time VARCHAR(50),
+      series_date VARCHAR(20),
+      series_time VARCHAR(50),
+      acquisition_date VARCHAR(20),
+      acquisition_time VARCHAR(50),
+      content_date VARCHAR(20),
+      content_time VARCHAR(50),
+      accession_number VARCHAR(100),
+      study_id VARCHAR(100),
+      series_number VARCHAR(20),
+      acquisition_number VARCHAR(20),
+      instance_number VARCHAR(20),
+      
+      -- Equipment Information
+      modality VARCHAR(10),
+      manufacturer VARCHAR(100),
+      institution_name VARCHAR(255),
+      manufacturer_model_name VARCHAR(100),
+      software_versions VARCHAR(100),
+      
+      -- Patient Information (from image)
+      patient_position VARCHAR(20),
+      body_part_examined VARCHAR(50),
+      
+      -- Imaging Parameters
+      scanning_sequence VARCHAR(50),
+      sequence_variant VARCHAR(100),
+      scan_options VARCHAR(100),
+      mr_acquisition_type VARCHAR(10),
+      sequence_name VARCHAR(100),
+      slice_thickness VARCHAR(20),
+      spacing_between_slices VARCHAR(20),
+      repetition_time VARCHAR(20),
+      echo_time VARCHAR(20),
+      echo_numbers VARCHAR(20),
+      number_of_averages VARCHAR(20),
+      imaging_frequency VARCHAR(50),
+      imaged_nucleus VARCHAR(20),
+      magnetic_field_strength VARCHAR(20),
+      number_of_phase_encoding_steps VARCHAR(20),
+      echo_train_length VARCHAR(20),
+      percent_sampling VARCHAR(20),
+      percent_phase_field_of_view VARCHAR(20),
+      pixel_bandwidth VARCHAR(20),
+      flip_angle VARCHAR(20),
+      variable_flip_angle_flag VARCHAR(10),
+      sar VARCHAR(50),
+      db_dt VARCHAR(50),
+      
+      -- Image Position/Orientation
+      image_position_patient TEXT,
+      image_orientation_patient TEXT,
+      slice_location VARCHAR(50),
+      position_reference_indicator VARCHAR(100),
+      
+      -- Image Characteristics
+      samples_per_pixel VARCHAR(10),
+      photometric_interpretation VARCHAR(50),
+      image_rows VARCHAR(10),
+      image_columns VARCHAR(10),
+      pixel_spacing TEXT,
+      bits_allocated VARCHAR(10),
+      bits_stored VARCHAR(10),
+      high_bit VARCHAR(10),
+      pixel_representation VARCHAR(10),
+      smallest_image_pixel_value VARCHAR(20),
+      largest_image_pixel_value VARCHAR(20),
+      window_center VARCHAR(20),
+      window_width VARCHAR(20),
+      window_center_width_explanation VARCHAR(100),
+      
+      -- Acquisition Details
+      acquisition_matrix TEXT,
+      in_plane_phase_encoding_direction VARCHAR(20),
+      transmit_coil_name VARCHAR(100),
+      
+      -- Procedure Information
+      study_description TEXT,
+      series_description TEXT,
+      requested_procedure_description TEXT,
+      performed_procedure_step_start_date VARCHAR(20),
+      performed_procedure_step_start_time VARCHAR(50),
+      performed_procedure_step_id VARCHAR(100),
+      performed_procedure_step_description TEXT,
+      comments_on_performed_procedure_step TEXT,
+      
+      -- Physician Information
+      referring_physician_name VARCHAR(255),
+      performing_physician_name VARCHAR(255),
+      
+      -- Privacy
+      specific_character_set VARCHAR(50),
+      patient_identity_removed VARCHAR(10),
+      deidentification_method TEXT,
+      
+      -- Other
+      image_type TEXT,
+      angio_flag VARCHAR(10),
+      instance_creation_date VARCHAR(20),
+      instance_creation_time VARCHAR(50),
+      
+      -- Full JSON backup
+      metadata_json JSON,
+      
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_patient_id (patient_id),
+      INDEX idx_patient_image (patient_id, image_index),
+      INDEX idx_modality (modality),
+      INDEX idx_series_number (series_number),
+      INDEX idx_body_part (body_part_examined),
+      FOREIGN KEY (patient_id) REFERENCES medical_patients(patient_id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+  console.log("✓ Created medical_metadata table");
+
+
+  // TABLE: counter
   await db.execute(`
     CREATE TABLE IF NOT EXISTS counter (
       id INT PRIMARY KEY,
-      num INT
-    );
+      count INT DEFAULT 0
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+  console.log("✓ Created counter table");
 
-  await db.execute(`
-    INSERT IGNORE INTO counter(id, num) VALUES (1, 0);
-  `);
+  await db.execute(`INSERT IGNORE INTO counter(id, count) VALUES (1, 0);`);
+  console.log("✓ Initialized counter\n");
 
-  console.log("MySQL connected");
   return db;
 }
-
 // =========================
-// 3. REDIS CONNECTION
+// 6. REDIS CONNECTION
 // =========================
 async function initRedis() {
   const client = redis.createClient();
   await client.connect();
-  console.log("Redis connected\n");
+
+  // Tắt chặn ghi khi RDB snapshot fail
+  await client.configSet('stop-writes-on-bgsave-error', 'no');
+
+  console.log("✓ Redis connected\n");
   return client;
 }
 
 // =========================
-// 4. INSERT DATA TO BOTH DB
+// 8. DEMO FUNCTIONS
 // =========================
-async function insertData(db, redisClient) {
-  console.log("Inserting data...");
 
-  for (let r of rows) {
-    const id = r["Patient ID"] || null;
-    let notes = r["Clinician's Notes"] || null;
-
-    if (!id) continue;
-    if (!notes) notes = "";
-
-    // Insert MySQL
-    await db.execute(
-      "REPLACE INTO patients(patient_id, clinician_notes) VALUES (?, ?)",
-      [id, notes]
-    );
-
-    // Insert Redis
-    await redisClient.hSet(`patient:${id}`, "id", String(id));
-    await redisClient.hSet(`patient:${id}`, "notes", notes);
-  }
-
-  console.log(`Inserted ${rows.length} records into MySQL & Redis\n`);
-}
-
-// =========================
-// 5. QUERY PROCESSING DEMO
-// =========================
-// demo search keyword
-async function demoQueryProcessing(db, redisClient) {
+// DEMO 1: Query with FULLTEXT search
+async function demoFullTextSearch(db, redisClient) {
   console.log("=".repeat(60));
-  console.log("DEMO 1: QUERY KEYWORD PROCESSING");
+  console.log("DEMO 1: FULLTEXT SEARCH IN CLINICAL NOTES");
   console.log("=".repeat(60));
 
   const keyword = "stenosis";
-  console.log(`Searching for keyword: "${keyword}"\n`);
+  console.log(`Searching for: "${keyword}"\n`);
 
-  // --- MySQL FULLTEXT Search ---
+  // MySQL FULLTEXT
   const mysqlStart = performance.now();
   const [mysqlResult] = await db.query(
-    `SELECT patient_id FROM patients 
-     WHERE MATCH(clinician_notes) AGAINST(? IN NATURAL LANGUAGE MODE);`,
+    `SELECT patient_id, patient_name, LEFT(clinical_notes, 100) as notes_preview 
+     FROM medical_patients 
+     WHERE MATCH(clinical_notes) AGAINST(? IN NATURAL LANGUAGE MODE)
+     LIMIT 10`,
     [keyword]
   );
   const mysqlTime = (performance.now() - mysqlStart).toFixed(3);
 
-  console.log(`MySQL Query Time: ${mysqlTime}ms`);
-  console.log(`MySQL found: ${mysqlResult.length} records`);
-  console.log(`Sample IDs: ${mysqlResult.map(r => r.patient_id).join(", ")}\n`);
+  console.log(`MySQL Time: ${mysqlTime}ms`);
+  console.log(`Found: ${mysqlResult.length} patients`);
 
-  // --- Redis Scan + Filter ---
+  // Redis scan and filter
   const redisStart = performance.now();
-  const redisKeys = await redisClient.keys("patient:*");
-
+  const keys = await redisClient.keys("medical:patient:*");
   const matches = [];
-  for (let key of redisKeys) {
-    const notes = await redisClient.hGet(key, "notes");
-    if (notes && notes.toLowerCase().includes(keyword)) {
-      matches.push(key);
+
+  for (let key of keys) {
+    if (key.includes(":images")) continue;
+    const notes = await redisClient.hGet(key, "clinical_notes");
+    if (notes && notes.toLowerCase().includes(keyword.toLowerCase())) {
+      const data = await redisClient.hGetAll(key);
+      matches.push(data);
     }
   }
   const redisTime = (performance.now() - redisStart).toFixed(3);
 
-  console.log(`Redis Query Time: ${redisTime}ms`);
-  console.log(`Redis found: ${matches.length} records`);
-  console.log(`Sample keys: ${matches.join(", ")}\n`);
+  console.log(`\nRedis Time: ${redisTime}ms`);
+  console.log(`Found: ${matches.length} patients\n`);
 
-  // --- MySQL FULLTEXT Search Redis Scan + Filter ---
   const speedup = (redisTime / mysqlTime).toFixed(2);
-  if (mysqlTime < redisTime) {
-    console.log(`MySQL is ${speedup}x FASTER for full-text search`);
-  } else {
-    console.log(`Redis is ${(mysqlTime / redisTime).toFixed(2)}x FASTER\n`);
-  }
+  console.log(`MySQL is ${speedup}x FASTER for full-text search\n`);
 }
 
-// =========================
-// 6. KEY LOOKUP DEMO
-// =========================
-async function demoFastKeyLookup(db, redisClient) {
+// DEMO 2: Key lookup
+async function demoKeyLookup(db, redisClient) {
   console.log("=".repeat(60));
-  console.log("DEMO 2: KEY-VALUE LOOKUP SPEED");
+  console.log("DEMO 2: KEY LOOKUP BY PATIENT ID");
   console.log("=".repeat(60));
 
-  const testId = 250;
+  const testId = 1;
   console.log(`Looking up Patient ID: ${testId}\n`);
 
-  // --- MySQL ---
+  // MySQL
   const mysqlStart = performance.now();
-  const [mysqlResult] = await db.query(
-    "SELECT * FROM patients WHERE patient_id=?",
-    [testId]
-  );
+  const [patient] = await db.query("SELECT * FROM medical_patients WHERE patient_id=?", [testId]);
+  const [images] = await db.query("SELECT COUNT(*) as cnt FROM medical_images WHERE patient_id=?", [testId]);
   const mysqlTime = (performance.now() - mysqlStart).toFixed(3);
 
-  console.log(`MySQL GET by ID: ${mysqlTime}ms`);
-  console.log(`Found: ${mysqlResult.length} record\n`);
+  console.log(`MySQL Time: ${mysqlTime}ms`);
+  if (patient[0]) {
+    console.log(`Patient: ${patient[0].patient_name}, Images: ${images[0].cnt}`);
+  }
 
-  // --- Redis ---
+  // Redis
   const redisStart = performance.now();
-  const redisResult = await redisClient.hGetAll(`patient:${testId}`);
+  const patientData = await redisClient.hGetAll(`medical:patient:${testId}`);
+  const imageIds = await redisClient.sMembers(`medical:patient:${testId}:images`);
   const redisTime = (performance.now() - redisStart).toFixed(3);
 
-  console.log(`Redis HGET by ID: ${redisTime}ms`);
-  console.log(`Found: ${redisResult.length} record\n`);
+  console.log(`\nRedis Time: ${redisTime}ms`);
+  if (patientData.patient_name) {
+    console.log(`Patient: ${patientData.patient_name}, Images: ${imageIds.length}`);
+  }
 
-  // --- Redis stores data in RAM (O(1) access) MySQL must read from disk + B-tree traversal ---
   const speedup = (mysqlTime / redisTime).toFixed(2);
-  console.log(`Redis is ${speedup}x FASTER for key lookup!`);
+  console.log(`\nRedis is ${speedup}x FASTER\n`);
 }
 
-// =========================
-// 7. COUNTER DEMO
-// =========================
+// DEMO 3: Counter
 async function demoCounter(db, redisClient) {
   console.log("=".repeat(60));
-  console.log("DEMO 3: ATOMIC COUNTER OPERATIONS");
+  console.log("DEMO 3: ATOMIC COUNTER (100 increments)");
   console.log("=".repeat(60));
-  console.log(`Incrementing counter 100 times...\n`);
 
-  // --- MySQL ---
+  const iterations = 100;
+
+  // MySQL
   const mysqlStart = performance.now();
-  for (let i = 0; i < 100; i++) {
-    await db.query("UPDATE counter SET num = num + 1 WHERE id=1");
+  for (let i = 0; i < iterations; i++) {
+    await db.query("UPDATE counter SET count = count + 1 WHERE id=1");
   }
   const mysqlTime = (performance.now() - mysqlStart).toFixed(3);
+  console.log(`MySQL: ${mysqlTime}ms (${(mysqlTime / iterations).toFixed(3)}ms avg)`);
 
-  console.log(`MySQL (100 UPDATEs): ${mysqlTime}ms`);
-  console.log(`Average per operation: ${(mysqlTime / 100).toFixed(3)}ms\n`);
-
-  // --- Redis ---
+  // Redis
   const redisStart = performance.now();
-  for (let i = 0; i < 100; i++) {
-    await redisClient.incr("counter");
+  for (let i = 0; i < iterations; i++) {
+    await redisClient.incr("medical:counter");
   }
   const redisTime = (performance.now() - redisStart).toFixed(3);
+  console.log(`Redis: ${redisTime}ms (${(redisTime / iterations).toFixed(3)}ms avg)`);
 
-  console.log(`Redis (100 INCRs): ${redisTime}ms`);
-  console.log(`Average per operation: ${(redisTime / 100).toFixed(3)}ms\n`);
-
-  // --- Counter      Redis: view counts, like buttons, rate limiting ---
   const speedup = (mysqlTime / redisTime).toFixed(2);
-  console.log(`Redis is ${speedup}x FASTER for counters!`);
+  console.log(`\nRedis is ${speedup}x FASTER\n`);
 }
 
-// =========================
-// 8. TRANSACTION DEMO
-// =========================
-async function demoTransactionSuccess(db, redisClient) {
+
+// DEMO 4: Transaction
+async function demoTransaction(db, redisClient) {
   console.log("=".repeat(60));
   console.log("DEMO 4: TRANSACTION SUPPORT");
   console.log("=".repeat(60));
 
-  // --- MySQL ACID Transaction ---
-  console.log("MySQL Transaction (ACID compliant):\n");
-
+  // MySQL
+  console.log("MySQL Transaction:\n");
   try {
     await db.beginTransaction();
-    console.log("BEGIN TRANSACTION");
-    const [beforeMySQL] = await db.execute(
-      "SELECT clinician_notes FROM patients WHERE patient_id=1"
-    );
-    console.log("Row before MySQL UPDATE:", beforeMySQL[0].clinician_notes);
+    console.log("BEGIN");
 
-    await db.execute(
-      `UPDATE patients SET clinician_notes=? WHERE patient_id=1`,
-      ["Updated via MySQL transaction"]
-    );
-    console.log("UPDATE executed");
+    const [before] = await db.query("SELECT clinical_notes FROM medical_patients WHERE patient_id=1");
+    console.log(`Before: ${before[0]?.clinical_notes || 'N/A'}`);
 
-    const [afterMySQL] = await db.execute(
-      "SELECT clinician_notes FROM patients WHERE patient_id=1"
-    );
-    console.log("Row after MySQL UPDATE:", afterMySQL[0].clinician_notes);
+    await db.execute("UPDATE medical_patients SET clinical_notes=? WHERE patient_id=1", [`${before[0]?.clinical_notes} (Updated_MySQL)`]);
+
+    const [after] = await db.query("SELECT clinical_notes FROM medical_patients WHERE patient_id=1");
+    console.log(`After: ${after[0]?.clinical_notes}`);
 
     await db.commit();
     console.log("COMMIT successful\n");
   } catch (err) {
-    await db.rollback(); // ho tro rollback
-    console.log("ROLLBACK executed");
+    await db.rollback();
+    console.log("ROLLBACK");
   }
 
-  // --- Redis MULTI/EXEC ---
-  console.log("Redis Transaction (MULTI/EXEC):\n");
+  // Redis
+  console.log("Redis Transaction:\n");
+  const tx = redisClient.multi();
+  const beforeRedis = await redisClient.hGet("medical:patient:1", "clinical_notes");
+  console.log(`Before: ${beforeRedis || 'N/A'}`);
 
-  const transaction = redisClient.multi();
-  const beforeRedis = await redisClient.hGet("patient:1", "notes");
-  console.log("Row after Redis UPDATE:", beforeRedis);
+  tx.hSet("medical:patient:1", "clinical_notes", `${beforeRedis} (Updated_Redis)`);
+  await tx.exec();
 
-  transaction.hSet("patient:1", "notes", "Updated via Redis MULTI/EXEC");
-  console.log("HSET queued");
-
-  try {
-    await transaction.exec();
-
-    const afterRedis = await redisClient.hGet("patient:1", "notes");
-    console.log("Row after Redis UPDATE:", afterRedis);
-    console.log("EXEC successful");
-  } catch (err) {
-    console.log("EXEC failed");
-  }
+  const afterRedis = await redisClient.hGet("medical:patient:1", "clinical_notes");
+  console.log(`After: ${afterRedis}`);
+  console.log("EXEC successful\n");
 }
 
-
-// =========================
-// 5. TRANSACTION ERROR HANDLING DEMO
-// =========================
+// DEMO 5: Transaction Error
 async function demoTransactionError(db, redisClient) {
   console.log("=".repeat(60));
   console.log("DEMO 5: TRANSACTION ERROR HANDLING");
   console.log("=".repeat(60));
-  console.log("Scenario: Update patient_id=1, then intentionally cause error\n");
 
-  // MYSQL - ROLLBACK ON ERROR
+  // MySQL with rollback
   console.log("MySQL Transaction with Error:\n");
-
-  // Đọc giá trị ban đầu
-  console.log("Step 1: Update value note")
-  const [beforeMySQL] = await db.query(
-    "SELECT clinician_notes FROM patients WHERE patient_id=1"
-  );
-  console.log(`Initial value: "${beforeMySQL[0]?.clinician_notes || 'N/A'}..."`);
+  const [before] = await db.query("SELECT clinical_notes FROM medical_patients WHERE patient_id=1");
+  console.log(`Initial: ${before[0]?.clinical_notes}`);
 
   try {
     await db.beginTransaction();
-    console.log("BEGIN TRANSACTION");
+    await db.execute("UPDATE medical_patients SET clinical_notes=? WHERE patient_id=1", ["Should_Rollback"]);
+    console.log("UPDATE executed");
 
-    // Step 1: Update thành công
-    await db.execute(
-      `UPDATE patients SET clinician_notes=? WHERE patient_id=1`,
-      ["MYSQL UPDATE - This should be rolled back"]
-    );
-    const [afterMySQLSuccess] = await db.query(
-      "SELECT clinician_notes FROM patients WHERE patient_id=1"
-    );
-    console.log(`afterMySQLSuccess: "${afterMySQLSuccess[0]?.clinician_notes || 'N/A'}"`);
-
-    // Step 2: gây lỗi - INSERT duplicate PRIMARY KEY
-    console.log("Step 2: Attempting to insert duplicate PRIMARY KEY...");
-    await db.execute(
-      `INSERT INTO patients (patient_id, clinician_notes) VALUES (1, 'This will fail')`
-    );
-    // Không bao giờ đến dòng này
-    console.log("Step 2: INSERT successful");
-
+    // Force error
+    await db.execute("INSERT INTO medical_patients (patient_id, clinical_notes) VALUES (1, 'duplicate')");
     await db.commit();
-    console.log("COMMIT successful");
   } catch (err) {
-    console.log(`Error occurred: ${err.message}`);
-    console.log("Executing ROLLBACK...");
+    console.log(`Error: ${err.message}`);
     await db.rollback();
-    console.log("ROLLBACK successful - all changes reverted!\n");
+    console.log("ROLLBACK executed");
   }
 
-  // check sau rollback
-  const [afterMySQL] = await db.query(
-    "SELECT clinician_notes FROM patients WHERE patient_id=1"
-  );
-  console.log(`Final value: "${afterMySQL[0]?.clinician_notes || 'N/A'}" \n`);
+  const [after] = await db.query("SELECT clinical_notes FROM medical_patients WHERE patient_id=1");
+  console.log(`Final: ${after[0]?.clinical_notes}\n`);
 
-  // REDIS - NO ROLLBACK (Commands still execute)
+  // Redis without rollback
   console.log("Redis Transaction with Error:\n");
-  // Đọc giá trị ban đầu
-  const beforeRedis = await redisClient.hGet("patient:1", "notes");
-  console.log(`Initial value: "${beforeRedis || 'N/A'}"`);
+  const beforeRedis = await redisClient.hGet("medical:patient:1", "clinical_notes");
+  console.log(`Initial: ${beforeRedis}`);
 
-  const transaction = redisClient.multi();
-  console.log("MULTI started");
+  const tx = redisClient.multi();
+  tx.hSet("medical:patient:1", "clinical_notes", "Will_Stay");
+  tx.incr("medical:patient:1"); // This will fail
 
-  // Step 1: Update thành công
-  transaction.hSet("patient:1", "notes", "REDIS UPDATE - This WILL stay");
-  console.log("Step 1: HSET queued");
+  const results = await tx.exec();
+  results.forEach((r, i) => console.log(`Step ${i + 1}: ${r instanceof Error ? 'FAILED' : 'SUCCESS'}`));
 
-  // Step 2: gây lỗi - sử dụng command sai kiểu dữ liệu
-  console.log("Step 2: Attempting INVALID command...");
-  transaction.incr("patient:1"); // Error: không thể INCR trên hash
-  console.log("Step 2: INCR queued (will fail on execution)");
-
-  try {
-    const results = await transaction.exec();
-    console.log("EXEC completed (but with errors)");
-
-    // Kiểm tra kết quả từng command
-    console.log("\nCommand Results:");
-    results.forEach((result, index) => {
-      if (result instanceof Error) {
-        console.log(`Step ${index + 1}: Error - ${result.message}`);
-      } else {
-        console.log(`Step ${index + 1}: Success`);
-      }
-    });
-    console.log();
-  } catch (err) {
-    console.log(`EXEC failed: ${err.message}\n`);
-  }
-
-  // Kiểm tra giá trị sau "rollback"
-  const afterRedis = await redisClient.hGet("patient:1", "notes");
-  console.log(`Final value: "${afterRedis || 'N/A'}"\n`);
+  const afterRedis = await redisClient.hGet("medical:patient:1", "clinical_notes");
+  console.log(`Final: ${afterRedis}\n`);
 }
 
-// =========================
-// 9. CONCURRENCY CONTROL DEMO
-// =========================
+// DEMO 6: Concurrency
 async function demoConcurrency(db, redisClient) {
   console.log("=".repeat(60));
   console.log("DEMO 6: CONCURRENCY CONTROL");
   console.log("=".repeat(60));
 
-  // --- MySQL Row Locking (Pessimistic) ---
-  console.log("MySQL Concurrency Control (Row Locking):\n");
-
+  // MySQL pessimistic locking
+  console.log("MySQL (Row Locking):\n");
   try {
     await db.beginTransaction();
-    console.log("BEGIN TRANSACTION");
+    console.log("BEGIN");
 
-    const [locked] = await db.execute(`
-      SELECT * FROM patients WHERE patient_id=1 FOR UPDATE;
-    `);
-    console.log("Row LOCKED with FOR UPDATE");
-    console.log(`Locked row ID: ${locked[0]?.patient_id || 'N/A'}`);
-    console.log("Other transactions must WAIT");
+    const [locked] = await db.execute("SELECT * FROM medical_patients WHERE patient_id=1 FOR UPDATE");
+    console.log(`Row LOCKED: Patient ${locked[0]?.patient_id}`);
+    console.log("Other transactions WAIT\n");
 
     await db.commit();
-    console.log("COMMIT - lock released");
+    console.log("COMMIT\n");
   } catch (err) {
     await db.rollback();
   }
 
-  // --- Redis Optimistic Locking (WATCH) ---
-  console.log("Redis Concurrency Control (Optimistic Locking):\n");
+  // Redis optimistic locking
+  console.log("Redis (Optimistic Locking):\n");
+  await redisClient.watch("medical:patient:1");
+  console.log("WATCH medical:patient:1");
 
-  await redisClient.watch("patient:1");
-  console.log("WATCH patient:1");
-  console.log("Monitoring for changes");
-
-  const notes = await redisClient.hGet("patient:1", "notes");
-  const updated = notes + " (edited)";
-
+  const name = await redisClient.hGet("medical:patient:1", "patient_name");
   const tx = redisClient.multi();
-  tx.hSet("patient:1", "notes", updated);
-  console.log("HSET queued");
+  tx.hSet("medical:patient:1", "patient_name", name + "_edited");
 
   const result = await tx.exec();
-  if (result === null) {
-    console.log("EXEC FAILED - key was modified by another client");
-    console.log("Transaction must retry");
-  } else {
-    console.log("EXEC successful");
-    console.log("Uses Optimistic Locking");
-    console.log("No deadlocks (single-threaded)\n");
-  }
+  console.log(result === null ? "EXEC FAILED (modified by another client)" : "EXEC successful\n");
 }
 
-// =========================
-// 9A. REAL MYSQL CONCURRENCY DEMO
-// =========================
 
+// =========================
+// DEMO 7: REAL MYSQL CONCURRENCY (PESSIMISTIC LOCKING)
+// =========================
 async function demoRealConcurrencyMySQL(db) {
   console.log("=".repeat(60));
-  console.log("DEMO 7: REAL MYSQL CONCURRENCY");
+  console.log("DEMO 7: REAL MYSQL CONCURRENCY - PESSIMISTIC LOCKING");
   console.log("=".repeat(60));
+  console.log("Simulating two clients A & B accessing same patient...\n");
 
-  console.log("Simulating two clients A & B...\n");
-
-  // --- CLIENT A ---
+  // Create two separate connections
   const clientA = await mysql.createConnection({
     host: "127.0.0.1",
     user: "root",
     password: "090604",
-    database: "dbms"
+    database: "dbms",
+    port: 3306
   });
 
-  // --- CLIENT B ---
   const clientB = await mysql.createConnection({
     host: "127.0.0.1",
     user: "root",
     password: "090604",
-    database: "dbms"
+    database: "dbms",
+    port: 3306
   });
 
-  // CLIENT A: BEGIN + LOCK
-  console.log("CLIENT A: BEGIN + SELECT ... FOR UPDATE");
-  await clientA.beginTransaction();
+  try {
+    // CLIENT A: BEGIN + LOCK ROW
+    console.log("CLIENT A: BEGIN TRANSACTION");
+    await clientA.beginTransaction();
 
-  const [rowA] = await clientA.execute(
-    "SELECT clinician_notes FROM patients WHERE patient_id=1 FOR UPDATE"
-  );
-  console.log("CLIENT A locked row:", rowA[0].clinician_notes);
+    const [beforeA] = await clientA.execute(
+      "SELECT patient_id, patient_name, clinical_notes FROM medical_patients WHERE patient_id=1 FOR UPDATE"
+    );
+    console.log(`CLIENT A locked patient: ${beforeA[0].patient_name}`);
+    console.log(`Current notes: ${beforeA[0].clinical_notes}`);
 
-  // CLIENT B: TRY TO UPDATE (WILL BLOCK)
-  console.log("\nCLIENT B: trying UPDATE (should block until A commits)");
+    // CLIENT B: TRY TO UPDATE (WILL BLOCK)
+    console.log("\nCLIENT B: Attempting UPDATE (will block until A commits)...");
+    const startTime = Date.now();
 
-  const start = Date.now();
+    // This will block until clientA commits
+    const clientB_promise = clientB
+      .execute(
+        "UPDATE medical_patients SET clinical_notes=CONCAT(clinical_notes, ' [UPDATED BY CLIENT B]') WHERE patient_id=1"
+      )
+      .then(async () => {
+        const endTime = Date.now();
+        const waitTime = ((endTime - startTime) / 1000).toFixed(2);
+        console.log(`\nCLIENT B: UPDATE COMPLETED after waiting ${waitTime} seconds`);
 
-  const B_promise = clientB
-    .execute(
-      "UPDATE patients SET clinician_notes=? WHERE patient_id=1",
-      ["UPDATE BY CLIENT B"]
-    )
-    .then(async () => {
-      const end = Date.now();
+        const [afterB] = await clientB.execute(
+          "SELECT clinical_notes FROM medical_patients WHERE patient_id=1"
+        );
+        console.log(`CLIENT B sees: ${afterB[0].clinical_notes}`);
+      })
+      .catch(err => {
+        console.error("CLIENT B error:", err.message);
+      });
 
-      console.log(
-        `CLIENT B update DONE — waited ${(end - start) / 1000} seconds for lock`
-      );
+    console.log("\nCLIENT A: COMMIT (releasing lock)");
+    await clientA.commit();
 
-      const [afterB] = await clientB.execute(
-        "SELECT clinician_notes FROM patients WHERE patient_id=1"
-      );
+    // Wait for CLIENT B to complete
+    await clientB_promise;
 
-      console.log("CLIENT B sees updated row:", afterB[0].clinician_notes);
-    });
+    // Verify final state
+    const [finalState] = await clientA.execute(
+      "SELECT clinical_notes FROM medical_patients WHERE patient_id=1"
+    );
+    console.log(`\nFinal state: ${finalState[0].clinical_notes}`);
 
+    console.log("\nMySQL Pessimistic Locking: CLIENT B was BLOCKED until CLIENT A committed!\n");
 
-  console.log("\nCLIENT A: now COMMIT (releasing lock)");
-  await clientA.commit();
-
-  await B_promise;
-
-  const [afterA] = await clientA.execute(
-    "SELECT clinician_notes FROM patients WHERE patient_id=1"
-  );
-  console.log("CLIENT A sees row AFTER B update:", afterA[0].clinician_notes);
-
-  console.log("\nMySQL Concurrency Successful: B waited until A committed!\n");
-
-  await clientA.end();
-  await clientB.end();
+  } catch (err) {
+    console.error("Error in MySQL demo:", err.message);
+    await clientA.rollback();
+  } finally {
+    await clientA.end();
+    await clientB.end();
+  }
 }
 
 
-
 // =========================
-// 9B. REAL REDIS OPTIMISTIC LOCKING DEMO
+// DEMO 8: REAL REDIS CONCURRENCY (OPTIMISTIC LOCKING)
 // =========================
 async function demoRealConcurrencyRedis(redisClient) {
   console.log("=".repeat(60));
-  console.log("DEMO 8: REAL REDIS CONCURRENCY (WATCH)");
+  console.log("DEMO 8: REAL REDIS CONCURRENCY - OPTIMISTIC LOCKING");
   console.log("=".repeat(60));
+  console.log("Simulating CLIENT A (with WATCH) and CLIENT B (modifier)...\n");
 
-  console.log("Simulating clients A (transaction) and B (modifier)...\n");
+  try {
+    // CLIENT A: WATCH + Read value
+    console.log("CLIENT A: WATCH medical:patient:1");
+    await redisClient.watch("medical:patient:1");
 
-  // CLIENT A: WATCH + MULTI
-  console.log("CLIENT A: WATCH patient:1");
-  await redisClient.watch("patient:1");
+    const oldNotes = await redisClient.hGet("medical:patient:1", "clinical_notes");
+    console.log(`CLIENT A reads: ${oldNotes}`);
 
-  const oldValue = await redisClient.hGet("patient:1", "notes");
-  console.log("CLIENT A reads:", oldValue);
+    // // Simulate processing time
+    // console.log("\nCLIENT A: Processing... (1 second)");
+    // await new Promise(resolve => setTimeout(resolve, 1000));
 
-  // CLIENT B CHANGES VALUE BEFORE A EXEC
-  console.log("\nCLIENT B: modifying value BEFORE CLIENT A EXEC");
-  await redisClient.hSet("patient:1", "notes", oldValue + " [MODIFIED BY B]");
-  console.log("Final value:", await redisClient.hGet("patient:1", "notes"));
+    // CLIENT B: Modify value BEFORE A commits
+    console.log("\nCLIENT B: Modifying value (NO BLOCKING!)");
+    await redisClient.hSet(
+      "medical:patient:1",
+      "clinical_notes",
+      oldNotes + " [MODIFIED BY CLIENT B]"
+    );
+    console.log("CLIENT B: Modification completed immediately");
 
-  // CLIENT A TRY EXEC
-  console.log("\nCLIENT A: preparing MULTI/EXEC");
-  const tx = redisClient.multi();
-  tx.hSet("patient:1", "notes", oldValue + " [UPDATE BY A]");
+    const modifiedValue = await redisClient.hGet("medical:patient:1", "clinical_notes");
+    console.log(`Current value: ${modifiedValue}`);
 
-  const result = await tx.exec();
+    // CLIENT A: Try to EXEC transaction
+    console.log("\nCLIENT A: Preparing MULTI/EXEC...");
+    const tx = redisClient.multi();
+    tx.hSet("medical:patient:1", "clinical_notes", oldNotes + " [UPDATE BY CLIENT A]");
 
-  if (result === null) {
-    console.log("EXEC FAILED → Key modified by another client!");
-    console.log("CLIENT A must retry transaction\n");
-  } else {
-    console.log("EXEC SUCCESS");
+    const result = await tx.exec();
+
+    if (result === null) {
+      console.log("CLIENT A: EXEC FAILED - Key was modified by another client!");
+      console.log("CLIENT A must RETRY the transaction\n");
+
+      // RETRY logic
+      console.log("CLIENT A: RETRYING transaction...");
+      const newValue = await redisClient.hGet("medical:patient:1", "clinical_notes");
+      await redisClient.hSet(
+        "medical:patient:1",
+        "clinical_notes",
+        newValue + " [UPDATE BY CLIENT A - RETRY]"
+      );
+      console.log("CLIENT A: RETRY SUCCESSFUL");
+    } else {
+      console.log("CLIENT A: EXEC SUCCESS (no conflicts)");
+    }
+
+    const finalValue = await redisClient.hGet("medical:patient:1", "clinical_notes");
+    console.log(`\nFinal value: ${finalValue}`);
+
+    console.log("\nRedis Optimistic Locking: CLIENT B was NOT BLOCKED, CLIENT A detected conflict and RETRIED!\n");
+
+  } catch (err) {
+    console.error("Error in Redis demo:", err.message);
   }
-
-  console.log("Final value:", await redisClient.hGet("patient:1", "notes"));
 }
 
+// =========================
+// MENU
+// =========================
+function ask(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
+}
+
+async function showMenu() {
+  console.log("=".repeat(60));
+  console.log("MEDICAL DATA COMPARISON: Redis vs MySQL");
+  console.log("=".repeat(60));
+  console.log("1. FullText Search (Clinical Notes)");
+  console.log("2. Key Lookup (Patient by ID)");
+  console.log("3. Atomic Counter");
+  console.log("4. Transaction Success");
+  console.log("5. Transaction Error Handling");
+  console.log("6. Concurrency Control (Simple Demo)");
+  console.log("7. Real MySQL Concurrency (Pessimistic Locking)");
+  console.log("8. Real Redis Concurrency (Optimistic Locking)");
+  console.log("0. Exit");
+  console.log("=".repeat(60));
+  return (await ask("Choose: ")).trim();
+}
 
 // =========================
-// MAIN EXECUTION
+// MAIN
 // =========================
 async function main() {
   try {
+    console.log("=".repeat(60));
+    console.log("MEDICAL DATA LOADER FROM JSON");
+    console.log("=".repeat(60));
+
+    // Read metadata from JSON files in data/metadata
+    const metadataArray = readMetadataFromJSON("./data");
+
+    if (metadataArray.length === 0) {
+      console.log("⚠ No metadata found in data/metadata folder!");
+      process.exit(1);
+    }
+
+    // Process into patient structure
+    const patientData = processMetadataIntoPatients(metadataArray);
+
+    // Initialize databases
     const db = await initMySQL();
     const redisClient = await initRedis();
-    await insertData(db, redisClient);
 
+    // Insert data
+    await insertData(db, redisClient, patientData);
+
+    // Run demos
     while (true) {
       const choice = await showMenu();
 
-      if (choice === "1") await demoQueryProcessing(db, redisClient);
-      else if (choice === "2") await demoFastKeyLookup(db, redisClient);
+      if (choice === "1") await demoFullTextSearch(db, redisClient);
+      else if (choice === "2") await demoKeyLookup(db, redisClient);
       else if (choice === "3") await demoCounter(db, redisClient);
-      else if (choice === "4") await demoTransactionSuccess(db, redisClient);
+      else if (choice === "4") await demoTransaction(db, redisClient);
       else if (choice === "5") await demoTransactionError(db, redisClient);
       else if (choice === "6") await demoConcurrency(db, redisClient);
       else if (choice === "7") await demoRealConcurrencyMySQL(db);
       else if (choice === "8") await demoRealConcurrencyRedis(redisClient);
       else if (choice === "0") {
-        console.log("\nThoát chương trình...");
+        console.log("\nExiting...");
         break;
-      } else {
-        console.log("Lựa chọn không hợp lệ, vui lòng nhập lại!");
       }
     }
+
 
     await db.end();
     await redisClient.quit();
     process.exit(0);
 
   } catch (error) {
-    console.error("Error:", error.message);
+    console.error("Error:", error);
+    console.error("Stack trace:", error.stack);
     process.exit(1);
   }
 }
-
-function ask(question) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-
-  return new Promise(resolve =>
-    rl.question(question, ans => {
-      rl.close();
-      resolve(ans);
-    })
-  );
-}
-
-async function showMenu() {
-  console.log("==============================");
-  console.log("CHỌN DEMO MUỐN CHẠY:");
-  console.log("1. Query Processing");
-  console.log("2. Key Lookup Speed");
-  console.log("3. Atomic Counter");
-  console.log("4. Transaction Success");
-  console.log("5. Transaction Error Handling");
-  console.log("6. Concurrency Control");
-  console.log("7. MySQL Real Concurrency");
-  console.log("8. Redis Real Concurrency");
-  console.log("0. Thoát");
-  console.log("==============================");
-
-  const choice = await ask("Nhập lựa chọn: ");
-  return choice.trim();
-}
-
 
 
 main();
