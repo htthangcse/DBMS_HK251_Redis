@@ -1,81 +1,120 @@
-# Redis vs MySQL
+# So Sánh Redis vs MySQL
 
-## Overview
-Dự án này trình bày và so sánh hiệu suất và hành vi của Redis và MySQL trên một số hoạt động cơ sở dữ liệu bao gồm full-text search, key lookup speed, transactions, error handling, and concurrency control.
+## Tổng Quan
+Dự án này trình bày và so sánh hiệu suất cũng như hành vi của Redis và MySQL qua nhiều thao tác cơ sở dữ liệu khác nhau trên dữ liệu hình ảnh y tế. Hệ thống xử lý metadata DICOM và ghi chú lâm sàng để thể hiện sự khác biệt về:
 
-## Features
-- Import data from `Radiologists Report.xlsx` into both Redis and MySQL.
-- Compare performance across multiple operations:
-  - Query processing
-  - Key-value lookup
-  - Atomic counters
-  - Transaction behavior
-  - Error handling
-  - Concurrency control
-  - Real-world concurrency simulations
+- Hiệu suất tìm kiếm toàn văn (full-text search)
+- Tốc độ tra cứu key-value
+- Thao tác nguyên tử (atomic operations)
+- Xử lý giao dịch (transactions)
+- Quản lý lỗi
+- Chiến lược kiểm soát đồng thời (concurrency control)
 
-## Requirements
-- Node.js >= 16
-- MySQL 8+
-- Redis 6 or 7
-- npm
+## Tính Năng
 
-## Setup
+### Xử Lý Dữ Liệu
+- Import metadata hình ảnh y tế từ file JSON
+- Tải ghi chú lâm sàng từ file CSV
+- Lưu trữ dữ liệu bệnh nhân, bản ghi hình ảnh và metadata DICOM trong cả Redis và MySQL
 
-### 1. Install dependencies
+### So Sánh Hiệu Suất
+1. **Tìm Kiếm Toàn Văn**: Tìm kiếm thuật ngữ y tế trong ghi chú lâm sàng
+2. **Tra Cứu Key**: Truy xuất trực tiếp bản ghi bệnh nhân theo ID
+3. **Bộ Đếm Nguyên Tử**: Thao tác tăng số với tần suất cao
+4. **Giao Dịch Thành Công**: Minh họa giao dịch ACID
+5. **Xử Lý Lỗi Giao Dịch**: So sánh hành vi rollback
+6. **Kiểm Soát Đồng Thời**: Khóa bi quan vs khóa lạc quan
+7. **Đồng Thời Thực Tế**: Kịch bản đa client thực tế
+
+## Yêu Cầu Hệ Thống
+
+- **Node.js** >= 16
+- **MySQL** 8+
+- **Redis** 6 hoặc 7
+- **npm** package manager
+
+## Cấu Trúc Dự Án
+
+```
+/project
+├── index.js                          # File chính của ứng dụng
+├── package.json                      # Các dependencies của Node.js
+├── README.md                         # File này
+├── data/
+│   ├── metadata/                     # Các file JSON metadata (bắt buộc)
+│   │   ├── 1.json
+│   │   ├── 2.json
+│   │   └── ...
+│   └── text_data.csv                 # CSV ghi chú lâm sàng (bắt buộc)
+└── node_modules/                     # Các dependencies đã cài đặt
+```
+
+## Yêu Cầu Dữ Liệu
+
+### 1. File JSON Metadata
+
+Đặt các file JSON metadata DICOM đã parse vào thư mục `./data/metadata/`. Mỗi file JSON đại diện cho một bệnh nhân và chứa một mảng metadata của các hình ảnh.
+
+## Hướng Dẫn Cài Đặt
+
+### 1. Cài Đặt Dependencies
+
 ```bash
 npm install
 ```
 
-### 2. MySQL Setup
-Create the database:
+**Các package cần thiết:**
+- `mysql2` - Driver MySQL
+- `redis` - Client Redis
+- `xlsx` - Xử lý file Excel
+- `csv-parser` - Parse CSV
+
+### 2. Cấu Hình MySQL
+
+Tạo database:
 ```sql
 CREATE DATABASE dbms;
 ```
 
-Configure MySQL credentials in `index.js`:
-```js
-host: "127.0.0.1",
-user: "root",
-password: "YOUR_PASSWORD",
-database: "dbms",
-port: 3306
+Cập nhật thông tin đăng nhập MySQL trong `index.js` (khoảng dòng 560):
+```javascript
+const db = await mysql.createConnection({
+  host: "127.0.0.1",
+  user: "root",
+  password: "MẬT_KHẨU_CỦA_BẠN",  // ⚠️ Thay đổi ở đây
+  database: "dbms",
+  port: 3306
+});
 ```
 
-### 3. Redis Setup
-Start Redis server:
-```bash
-redis-server
-```
+### 3. Chuẩn Bị File Dữ Liệu
 
-### 4. Place Excel File
-Ensure that `Radiologists Report.xlsx` is in the project root.
+Đảm bảo các file sau tồn tại:
+- `./data/metadata/*.json` - Các file metadata bệnh nhân
+- `./data/text_data.csv` - Ghi chú lâm sàng
 
-### 5. Run the project
+### 4. Chạy Ứng Dụng
+
 ```bash
 node index.js
 ```
 
-## Menu Options
-Upon running, the CLI menu will appear:
+## Cách Sử Dụng
+
+Khi chạy, menu tương tác sẽ xuất hiện:
 
 ```
-1. Query Processing
-2. Key Lookup Speed
-3. Atomic Counter
-4. Transaction Success
-5. Transaction Error Handling
-6. Concurrency Control
-7. MySQL Real Concurrency
-8. Redis Real Concurrency
-0. Exit
-```
-
-## Project Structure
-```
-/project
-|── index.js
-|── package.json
-|── Radiologists Report.xlsx
-|── node_modules/
+============================================================
+SO SÁNH DỮ LIỆU Y TẾ: Redis vs MySQL
+============================================================
+1. Tìm Kiếm Toàn Văn (Ghi Chú Lâm Sàng)
+2. Tra Cứu Key (Bệnh Nhân Theo ID)
+3. Bộ Đếm Nguyên Tử
+4. Giao Dịch Thành Công
+5. Xử Lý Lỗi Giao Dịch
+6. Kiểm Soát Đồng Thời (Demo Đơn Giản)
+7. Đồng Thời MySQL Thực Tế (Khóa Bi Quan)
+8. Đồng Thời Redis Thực Tế (Khóa Lạc Quan)
+0. Thoát
+============================================================
 ```
