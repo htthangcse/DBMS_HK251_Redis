@@ -1,7 +1,7 @@
 # Redis vs MySQL
 
 ## Overview
-This project demonstrates and compares the performance and behavior of Redis and MySQL across several database operations including full-text search, key lookup speed, transactions, error handling, and concurrency control.
+Dự án này trình bày và so sánh hiệu suất và hành vi của Redis và MySQL trên một số hoạt động cơ sở dữ liệu bao gồm full-text search, key lookup speed, transactions, error handling, and concurrency control.
 
 ## Features
 - Import data from `Radiologists Report.xlsx` into both Redis and MySQL.
